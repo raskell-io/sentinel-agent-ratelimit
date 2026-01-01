@@ -25,7 +25,8 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 use sentinel_agent_protocol::{
-    AgentHandler, AgentResponse, AgentServer, AuditMetadata, Decision, HeaderOp, RequestHeadersEvent,
+    AgentHandler, AgentResponse, AgentServer, AuditMetadata, ConfigureEvent, Decision, HeaderOp,
+    RequestHeadersEvent,
 };
 
 /// Rate limit agent command-line arguments
@@ -68,17 +69,21 @@ struct Args {
 
 /// Rate limit configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 struct RateLimitConfig {
     /// Rate limit rules
+    #[serde(default)]
     rules: Vec<RateLimitRule>,
     /// Default rule if no specific rule matches
     default: RateLimitRule,
     /// Enable dry-run mode
+    #[serde(default)]
     dry_run: bool,
 }
 
 /// Individual rate limit rule
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 struct RateLimitRule {
     /// Rule name/ID
     name: String,
@@ -303,6 +308,46 @@ impl RateLimitAgent {
 
 #[async_trait]
 impl AgentHandler for RateLimitAgent {
+    async fn on_configure(&self, event: ConfigureEvent) -> AgentResponse {
+        info!(
+            agent_id = %event.agent_id,
+            "Received configuration event"
+        );
+
+        // Parse the configuration from JSON
+        match serde_json::from_value::<RateLimitConfig>(event.config) {
+            Ok(new_config) => {
+                info!(
+                    rules = new_config.rules.len(),
+                    default_rps = new_config.default.requests_per_second,
+                    dry_run = new_config.dry_run,
+                    "Applying new rate limit configuration"
+                );
+
+                // Update the configuration
+                let mut config = self.config.write();
+                *config = new_config;
+
+                // Clear existing rate limiters to apply new rules
+                self.limiters.clear();
+                self.metrics
+                    .active_limiters
+                    .store(0, std::sync::atomic::Ordering::Relaxed);
+
+                debug!("Configuration updated successfully");
+                AgentResponse::default_allow()
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "Failed to parse configuration, keeping existing config"
+                );
+                // Return allow but log the error - don't block requests due to config error
+                AgentResponse::default_allow()
+            }
+        }
+    }
+
     async fn on_request_headers(&self, event: RequestHeadersEvent) -> AgentResponse {
         self.request_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -395,6 +440,10 @@ impl AgentHandler for RateLimitAgent {
                 response_headers: vec![],
                 routing_metadata: HashMap::new(),
                 audit: AuditMetadata::default(),
+                needs_more: false,
+                request_body_mutation: None,
+                response_body_mutation: None,
+                websocket_decision: None,
             }
         } else {
             if limited {
