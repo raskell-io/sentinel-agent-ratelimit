@@ -2,6 +2,13 @@
 //!
 //! This agent provides distributed rate limiting using token bucket algorithm
 //! with support for multiple rate limit keys and configurable limits.
+//!
+//! Supports Protocol v2 with:
+//! - Capability negotiation
+//! - Health reporting
+//! - Metrics export
+//! - Configuration push
+//! - gRPC and UDS transports
 
 #![allow(dead_code)]
 
@@ -20,13 +27,18 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
+use sentinel_agent_protocol::v2::{
+    AgentCapabilities, AgentFeatures, AgentHandlerV2, AgentLimits, CounterMetric, DrainReason,
+    GaugeMetric, GrpcAgentServerV2, HealthConfig, HealthStatus, LoadMetrics, MetricsReport,
+    ShutdownReason,
+};
 use sentinel_agent_protocol::{
-    AgentHandler, AgentResponse, AgentServer, AuditMetadata, ConfigureEvent, Decision, HeaderOp,
-    RequestHeadersEvent,
+    AgentResponse, AgentServer, AuditMetadata, Decision, EventType, HeaderOp, RequestHeadersEvent,
 };
 
 /// Rate limit agent command-line arguments
@@ -41,6 +53,11 @@ struct Args {
         default_value = "/tmp/ratelimit-agent.sock"
     )]
     socket: PathBuf,
+
+    /// gRPC address to listen on (e.g., "0.0.0.0:50051")
+    /// If provided, uses gRPC transport instead of UDS
+    #[arg(long, env = "RATELIMIT_AGENT_GRPC_ADDRESS")]
+    grpc_address: Option<String>,
 
     /// Configuration file path
     #[arg(short, long, env = "RATELIMIT_AGENT_CONFIG")]
@@ -148,21 +165,25 @@ struct RateLimiterEntry {
 struct RateLimitAgent {
     /// Configuration
     config: Arc<RwLock<RateLimitConfig>>,
+    /// Configuration version
+    config_version: Arc<RwLock<Option<String>>>,
     /// Rate limiters by key
     limiters: Arc<DashMap<String, RateLimiterEntry>>,
     /// Request counter
-    request_count: Arc<std::sync::atomic::AtomicU64>,
+    request_count: Arc<AtomicU64>,
     /// Rate limited counter
-    limited_count: Arc<std::sync::atomic::AtomicU64>,
+    limited_count: Arc<AtomicU64>,
     /// Metrics
     metrics: Arc<RateLimitMetrics>,
+    /// Draining flag
+    draining: Arc<RwLock<bool>>,
 }
 
 /// Rate limit metrics
 struct RateLimitMetrics {
-    requests_total: std::sync::atomic::AtomicU64,
-    requests_allowed: std::sync::atomic::AtomicU64,
-    requests_limited: std::sync::atomic::AtomicU64,
+    requests_total: AtomicU64,
+    requests_allowed: AtomicU64,
+    requests_limited: AtomicU64,
     active_limiters: std::sync::atomic::AtomicUsize,
 }
 
@@ -171,15 +192,17 @@ impl RateLimitAgent {
     fn new(config: RateLimitConfig) -> Self {
         Self {
             config: Arc::new(RwLock::new(config)),
+            config_version: Arc::new(RwLock::new(None)),
             limiters: Arc::new(DashMap::new()),
-            request_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            limited_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            request_count: Arc::new(AtomicU64::new(0)),
+            limited_count: Arc::new(AtomicU64::new(0)),
             metrics: Arc::new(RateLimitMetrics {
-                requests_total: std::sync::atomic::AtomicU64::new(0),
-                requests_allowed: std::sync::atomic::AtomicU64::new(0),
-                requests_limited: std::sync::atomic::AtomicU64::new(0),
+                requests_total: AtomicU64::new(0),
+                requests_allowed: AtomicU64::new(0),
+                requests_limited: AtomicU64::new(0),
                 active_limiters: std::sync::atomic::AtomicUsize::new(0),
             }),
+            draining: Arc::new(RwLock::new(false)),
         }
     }
 
@@ -273,9 +296,7 @@ impl RateLimitAgent {
             };
 
             self.limiters.insert(key, entry);
-            self.metrics
-                .active_limiters
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.metrics.active_limiters.fetch_add(1, Ordering::Relaxed);
 
             limiter
         }
@@ -297,21 +318,30 @@ impl RateLimitAgent {
         let expired_count = expired.len();
         for key in expired {
             self.limiters.remove(&key);
-            self.metrics
-                .active_limiters
-                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            self.metrics.active_limiters.fetch_sub(1, Ordering::Relaxed);
         }
 
         debug!("Cleaned up {} expired rate limiters", expired_count);
     }
 }
 
+/// Wrapper for v1 AgentHandler compatibility (UDS transport)
+struct RateLimitAgentV1Wrapper {
+    inner: RateLimitAgent,
+}
+
+impl RateLimitAgentV1Wrapper {
+    fn new(agent: RateLimitAgent) -> Self {
+        Self { inner: agent }
+    }
+}
+
 #[async_trait]
-impl AgentHandler for RateLimitAgent {
-    async fn on_configure(&self, event: ConfigureEvent) -> AgentResponse {
+impl sentinel_agent_protocol::AgentHandler for RateLimitAgentV1Wrapper {
+    async fn on_configure(&self, event: sentinel_agent_protocol::ConfigureEvent) -> AgentResponse {
         info!(
             agent_id = %event.agent_id,
-            "Received configuration event"
+            "Received configuration event (v1)"
         );
 
         // Parse the configuration from JSON
@@ -325,14 +355,15 @@ impl AgentHandler for RateLimitAgent {
                 );
 
                 // Update the configuration
-                let mut config = self.config.write();
+                let mut config = self.inner.config.write();
                 *config = new_config;
 
                 // Clear existing rate limiters to apply new rules
-                self.limiters.clear();
-                self.metrics
+                self.inner.limiters.clear();
+                self.inner
+                    .metrics
                     .active_limiters
-                    .store(0, std::sync::atomic::Ordering::Relaxed);
+                    .store(0, Ordering::Relaxed);
 
                 debug!("Configuration updated successfully");
                 AgentResponse::default_allow()
@@ -349,148 +380,345 @@ impl AgentHandler for RateLimitAgent {
     }
 
     async fn on_request_headers(&self, event: RequestHeadersEvent) -> AgentResponse {
-        self.request_count
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.metrics
-            .requests_total
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        process_request_headers(&self.inner, event).await
+    }
+}
 
-        debug!(
-            correlation_id = %event.metadata.correlation_id,
-            method = %event.method,
-            uri = %event.uri,
-            client_ip = %event.metadata.client_ip,
-            "Processing rate limit check"
+#[async_trait]
+impl AgentHandlerV2 for RateLimitAgent {
+    /// Return agent capabilities for v2 protocol handshake
+    fn capabilities(&self) -> AgentCapabilities {
+        AgentCapabilities {
+            protocol_version: 2,
+            agent_id: "ratelimit-agent".to_string(),
+            name: "Sentinel Rate Limit Agent".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            supported_events: vec![EventType::RequestHeaders, EventType::Configure],
+            features: AgentFeatures {
+                streaming_body: false,
+                websocket: false,
+                guardrails: false,
+                config_push: true,
+                metrics_export: true,
+                concurrent_requests: 1000,
+                cancellation: true,
+                flow_control: true,
+                health_reporting: true,
+            },
+            limits: AgentLimits {
+                max_body_size: 0, // We don't inspect bodies
+                max_concurrency: 1000,
+                preferred_chunk_size: 0,
+                max_memory: None,
+                max_processing_time_ms: Some(100), // Rate limiting should be fast
+            },
+            health: HealthConfig {
+                report_interval_ms: 10_000,
+                include_load_metrics: true,
+                include_resource_metrics: false,
+            },
+        }
+    }
+
+    /// Handle configuration updates (v2 signature)
+    async fn on_configure(&self, config: serde_json::Value, version: Option<String>) -> bool {
+        info!(
+            version = ?version,
+            "Received configuration event (v2)"
         );
 
-        // Find matching rule
-        let rule = self.find_matching_rule(&event);
+        // Parse the configuration from JSON
+        match serde_json::from_value::<RateLimitConfig>(config) {
+            Ok(new_config) => {
+                info!(
+                    rules = new_config.rules.len(),
+                    default_rps = new_config.default.requests_per_second,
+                    dry_run = new_config.dry_run,
+                    "Applying new rate limit configuration"
+                );
 
-        // Generate rate limit key
-        let key = self.generate_key(&rule.key, &event);
+                // Update the configuration
+                {
+                    let mut config_guard = self.config.write();
+                    *config_guard = new_config;
+                }
 
-        debug!(
-            rule = %rule.name,
-            key = %key,
-            rps = rule.requests_per_second,
-            burst = rule.burst,
-            "Applying rate limit rule"
-        );
+                // Update version
+                {
+                    let mut version_guard = self.config_version.write();
+                    *version_guard = version;
+                }
 
-        // Get or create limiter
-        let limiter = self.get_or_create_limiter(key.clone(), &rule);
+                // Clear existing rate limiters to apply new rules
+                self.limiters.clear();
+                self.metrics.active_limiters.store(0, Ordering::Relaxed);
 
-        // Check rate limit
-        let limited = match limiter.check() {
-            Ok(_) => {
-                self.metrics
-                    .requests_allowed
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                false
-            }
-            Err(_) => {
-                self.limited_count
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                self.metrics
-                    .requests_limited
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                debug!("Configuration updated successfully");
                 true
             }
-        };
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "Failed to parse configuration, keeping existing config"
+                );
+                false
+            }
+        }
+    }
 
-        // Create response
-        let mut response = if limited && !self.config.read().dry_run {
-            let status = rule.status_code.unwrap_or(429);
-            let message = rule.message.clone().unwrap_or_else(|| {
-                format!(
-                    "Rate limit exceeded: {} requests per second allowed",
-                    rule.requests_per_second
-                )
-            });
+    async fn on_request_headers(&self, event: RequestHeadersEvent) -> AgentResponse {
+        process_request_headers(self, event).await
+    }
 
-            warn!(
+    /// Return current health status
+    fn health_status(&self) -> HealthStatus {
+        let is_draining = *self.draining.read();
+
+        if is_draining {
+            HealthStatus {
+                agent_id: "ratelimit-agent".to_string(),
+                state: sentinel_agent_protocol::v2::HealthState::Draining { eta_ms: None },
+                message: Some("Agent is draining".to_string()),
+                load: Some(self.get_load_metrics()),
+                resources: None,
+                valid_until_ms: None,
+                timestamp_ms: now_ms(),
+            }
+        } else {
+            HealthStatus::healthy("ratelimit-agent").with_load(self.get_load_metrics())
+        }
+    }
+
+    /// Return current metrics report
+    fn metrics_report(&self) -> Option<MetricsReport> {
+        let requests_total = self.metrics.requests_total.load(Ordering::Relaxed);
+        let requests_allowed = self.metrics.requests_allowed.load(Ordering::Relaxed);
+        let requests_limited = self.metrics.requests_limited.load(Ordering::Relaxed);
+        let active_limiters = self.metrics.active_limiters.load(Ordering::Relaxed);
+
+        let mut report = MetricsReport::new("ratelimit-agent", 10_000);
+
+        report.counters.push(CounterMetric::new(
+            "ratelimit_requests_total",
+            requests_total,
+        ));
+        report.counters.push(CounterMetric::new(
+            "ratelimit_requests_allowed_total",
+            requests_allowed,
+        ));
+        report.counters.push(CounterMetric::new(
+            "ratelimit_requests_limited_total",
+            requests_limited,
+        ));
+        report.gauges.push(GaugeMetric::new(
+            "ratelimit_active_limiters",
+            active_limiters as f64,
+        ));
+
+        Some(report)
+    }
+
+    /// Handle shutdown request
+    async fn on_shutdown(&self, reason: ShutdownReason, grace_period_ms: u64) {
+        info!(
+            reason = ?reason,
+            grace_period_ms = grace_period_ms,
+            "Received shutdown request"
+        );
+
+        // Mark as draining to stop accepting new requests gracefully
+        *self.draining.write() = true;
+    }
+
+    /// Handle drain request
+    async fn on_drain(&self, duration_ms: u64, reason: DrainReason) {
+        info!(
+            duration_ms = duration_ms,
+            reason = ?reason,
+            "Received drain request"
+        );
+
+        // Mark as draining
+        *self.draining.write() = true;
+    }
+}
+
+impl RateLimitAgent {
+    fn get_load_metrics(&self) -> LoadMetrics {
+        let requests_total = self.metrics.requests_total.load(Ordering::Relaxed);
+        let requests_limited = self.metrics.requests_limited.load(Ordering::Relaxed);
+
+        LoadMetrics {
+            in_flight: 0, // We process synchronously
+            queue_depth: 0,
+            avg_latency_ms: 0.0, // Rate limiting is sub-millisecond
+            p50_latency_ms: 0.0,
+            p95_latency_ms: 0.0,
+            p99_latency_ms: 0.0,
+            requests_processed: requests_total,
+            requests_rejected: requests_limited,
+            requests_timed_out: 0,
+        }
+    }
+}
+
+/// Extension trait for HealthStatus
+trait HealthStatusExt {
+    fn with_load(self, load: LoadMetrics) -> Self;
+}
+
+impl HealthStatusExt for HealthStatus {
+    fn with_load(mut self, load: LoadMetrics) -> Self {
+        self.load = Some(load);
+        self
+    }
+}
+
+/// Shared request processing logic for both v1 and v2
+async fn process_request_headers(
+    agent: &RateLimitAgent,
+    event: RequestHeadersEvent,
+) -> AgentResponse {
+    agent.request_count.fetch_add(1, Ordering::Relaxed);
+    agent.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
+
+    debug!(
+        correlation_id = %event.metadata.correlation_id,
+        method = %event.method,
+        uri = %event.uri,
+        client_ip = %event.metadata.client_ip,
+        "Processing rate limit check"
+    );
+
+    // Find matching rule
+    let rule = agent.find_matching_rule(&event);
+
+    // Generate rate limit key
+    let key = agent.generate_key(&rule.key, &event);
+
+    debug!(
+        rule = %rule.name,
+        key = %key,
+        rps = rule.requests_per_second,
+        burst = rule.burst,
+        "Applying rate limit rule"
+    );
+
+    // Get or create limiter
+    let limiter = agent.get_or_create_limiter(key.clone(), &rule);
+
+    // Check rate limit
+    let limited = match limiter.check() {
+        Ok(_) => {
+            agent
+                .metrics
+                .requests_allowed
+                .fetch_add(1, Ordering::Relaxed);
+            false
+        }
+        Err(_) => {
+            agent.limited_count.fetch_add(1, Ordering::Relaxed);
+            agent
+                .metrics
+                .requests_limited
+                .fetch_add(1, Ordering::Relaxed);
+            true
+        }
+    };
+
+    // Create response
+    let mut response = if limited && !agent.config.read().dry_run {
+        let status = rule.status_code.unwrap_or(429);
+        let message = rule.message.clone().unwrap_or_else(|| {
+            format!(
+                "Rate limit exceeded: {} requests per second allowed",
+                rule.requests_per_second
+            )
+        });
+
+        warn!(
+            correlation_id = %event.metadata.correlation_id,
+            rule = %rule.name,
+            key = %key,
+            "Rate limit exceeded, blocking request"
+        );
+
+        let mut headers = HashMap::new();
+        headers.insert(
+            "X-RateLimit-Limit".to_string(),
+            rule.requests_per_second.to_string(),
+        );
+        headers.insert("X-RateLimit-Remaining".to_string(), "0".to_string());
+        headers.insert(
+            "X-RateLimit-Reset".to_string(),
+            (chrono::Utc::now() + chrono::Duration::seconds(1))
+                .timestamp()
+                .to_string(),
+        );
+        headers.insert("Retry-After".to_string(), "1".to_string());
+
+        AgentResponse {
+            version: sentinel_agent_protocol::PROTOCOL_VERSION,
+            decision: Decision::Block {
+                status,
+                body: Some(message),
+                headers: Some(headers),
+            },
+            request_headers: vec![],
+            response_headers: vec![],
+            routing_metadata: HashMap::new(),
+            audit: AuditMetadata::default(),
+            needs_more: false,
+            request_body_mutation: None,
+            response_body_mutation: None,
+            websocket_decision: None,
+        }
+    } else {
+        if limited {
+            info!(
                 correlation_id = %event.metadata.correlation_id,
                 rule = %rule.name,
                 key = %key,
-                "Rate limit exceeded, blocking request"
+                "Rate limit exceeded (dry-run mode)"
             );
-
-            let mut headers = HashMap::new();
-            headers.insert(
-                "X-RateLimit-Limit".to_string(),
-                rule.requests_per_second.to_string(),
-            );
-            headers.insert("X-RateLimit-Remaining".to_string(), "0".to_string());
-            headers.insert(
-                "X-RateLimit-Reset".to_string(),
-                (chrono::Utc::now() + chrono::Duration::seconds(1))
-                    .timestamp()
-                    .to_string(),
-            );
-            headers.insert("Retry-After".to_string(), "1".to_string());
-
-            AgentResponse {
-                version: sentinel_agent_protocol::PROTOCOL_VERSION,
-                decision: Decision::Block {
-                    status,
-                    body: Some(message),
-                    headers: Some(headers),
-                },
-                request_headers: vec![],
-                response_headers: vec![],
-                routing_metadata: HashMap::new(),
-                audit: AuditMetadata::default(),
-                needs_more: false,
-                request_body_mutation: None,
-                response_body_mutation: None,
-                websocket_decision: None,
-            }
-        } else {
-            if limited {
-                info!(
-                    correlation_id = %event.metadata.correlation_id,
-                    rule = %rule.name,
-                    key = %key,
-                    "Rate limit exceeded (dry-run mode)"
-                );
-            }
-
-            AgentResponse::default_allow()
-        };
-
-        // Add rate limit headers
-        response = response
-            .add_request_header(HeaderOp::Set {
-                name: "X-RateLimit-Rule".to_string(),
-                value: rule.name.clone(),
-            })
-            .add_request_header(HeaderOp::Set {
-                name: "X-RateLimit-Key".to_string(),
-                value: key.clone(),
-            });
-
-        // Add audit metadata
-        let mut audit = AuditMetadata::default();
-        audit.tags = vec!["ratelimit".to_string()];
-        if limited {
-            audit.tags.push("limited".to_string());
         }
-        audit
-            .custom
-            .insert("rule".to_string(), serde_json::Value::String(rule.name));
-        audit
-            .custom
-            .insert("key".to_string(), serde_json::Value::String(key));
-        audit
-            .custom
-            .insert("limited".to_string(), serde_json::Value::Bool(limited));
-        audit.custom.insert(
-            "rps".to_string(),
-            serde_json::Value::Number(rule.requests_per_second.into()),
-        );
 
-        response.with_audit(audit)
+        AgentResponse::default_allow()
+    };
+
+    // Add rate limit headers
+    response = response
+        .add_request_header(HeaderOp::Set {
+            name: "X-RateLimit-Rule".to_string(),
+            value: rule.name.clone(),
+        })
+        .add_request_header(HeaderOp::Set {
+            name: "X-RateLimit-Key".to_string(),
+            value: key.clone(),
+        });
+
+    // Add audit metadata
+    let mut tags = vec!["ratelimit".to_string()];
+    if limited {
+        tags.push("limited".to_string());
     }
+
+    let mut custom = HashMap::new();
+    custom.insert("rule".to_string(), serde_json::Value::String(rule.name));
+    custom.insert("key".to_string(), serde_json::Value::String(key));
+    custom.insert("limited".to_string(), serde_json::Value::Bool(limited));
+    custom.insert(
+        "rps".to_string(),
+        serde_json::Value::Number(rule.requests_per_second.into()),
+    );
+
+    let audit = AuditMetadata {
+        tags,
+        custom,
+        ..Default::default()
+    };
+
+    response.with_audit(audit)
 }
 
 /// Default configuration
@@ -512,6 +740,13 @@ impl Default for RateLimitConfig {
     }
 }
 
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Parse command-line arguments
@@ -530,7 +765,8 @@ async fn main() -> Result<()> {
     info!(
         version = env!("CARGO_PKG_VERSION"),
         socket = ?args.socket,
-        "Starting rate limit agent"
+        grpc_address = ?args.grpc_address,
+        "Starting rate limit agent (v2 protocol)"
     );
 
     // Load configuration
@@ -580,16 +816,37 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Create and run server
-    let server = AgentServer::new("ratelimit-agent", args.socket, Box::new(agent));
+    // Choose transport based on CLI arguments
+    if let Some(grpc_addr) = args.grpc_address {
+        // Use gRPC transport (v2)
+        info!(address = %grpc_addr, "Starting gRPC server (v2 protocol)");
 
-    info!("Rate limit agent ready and listening");
+        let addr: std::net::SocketAddr =
+            grpc_addr.parse().context("Invalid gRPC address format")?;
 
-    // Run server (blocks forever)
-    server
-        .run()
-        .await
-        .context("Failed to run rate limit agent server")?;
+        let server = GrpcAgentServerV2::new("ratelimit-agent", Box::new(agent));
+
+        info!("Rate limit agent ready and listening on gRPC");
+
+        server
+            .run(addr)
+            .await
+            .context("Failed to run rate limit agent gRPC server")?;
+    } else {
+        // Use UDS transport (v1 compatible with v2 handler)
+        info!(socket = ?args.socket, "Starting UDS server");
+
+        // Wrap the v2 agent in a v1-compatible wrapper for UDS
+        let wrapper = RateLimitAgentV1Wrapper::new(agent);
+        let server = AgentServer::new("ratelimit-agent", args.socket, Box::new(wrapper));
+
+        info!("Rate limit agent ready and listening on UDS");
+
+        server
+            .run()
+            .await
+            .context("Failed to run rate limit agent UDS server")?;
+    }
 
     Ok(())
 }
