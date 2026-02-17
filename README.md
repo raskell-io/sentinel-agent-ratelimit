@@ -1,6 +1,6 @@
-# sentinel-agent-ratelimit
+# zentinel-agent-ratelimit
 
-Token bucket rate limiting agent for [Sentinel](https://github.com/raskell-io/sentinel) reverse proxy.
+Token bucket rate limiting agent for [Zentinel](https://github.com/zentinelproxy/zentinel) reverse proxy.
 
 ## Features
 
@@ -15,28 +15,28 @@ Token bucket rate limiting agent for [Sentinel](https://github.com/raskell-io/se
 ### From crates.io
 
 ```bash
-cargo install sentinel-agent-ratelimit
+cargo install zentinel-agent-ratelimit
 ```
 
 ### From source
 
 ```bash
-git clone https://github.com/raskell-io/sentinel-agent-ratelimit
-cd sentinel-agent-ratelimit
+git clone https://github.com/zentinelproxy/zentinel-agent-ratelimit
+cd zentinel-agent-ratelimit
 cargo build --release
 ```
 
 ## Usage
 
 ```bash
-sentinel-ratelimit-agent --socket /var/run/sentinel/ratelimit.sock
+zentinel-ratelimit-agent --socket /var/run/zentinel/ratelimit.sock
 ```
 
 ### Command Line Options
 
 | Option | Environment Variable | Description | Default |
 |--------|---------------------|-------------|---------|
-| `--socket` | `AGENT_SOCKET` | Unix socket path | `/tmp/sentinel-ratelimit.sock` |
+| `--socket` | `AGENT_SOCKET` | Unix socket path | `/tmp/zentinel-ratelimit.sock` |
 | `--config` | `RATELIMIT_CONFIG` | Configuration file path | - |
 | `--default-rps` | `RATELIMIT_DEFAULT_RPS` | Default requests per second | `100` |
 | `--default-burst` | `RATELIMIT_DEFAULT_BURST` | Default burst size | `10` |
@@ -67,16 +67,16 @@ key_extraction:
   # header: "X-API-Key"  # if type is header
 ```
 
-### Sentinel Proxy Configuration
+### Zentinel Proxy Configuration
 
-Add to your Sentinel `config.kdl`:
+Add to your Zentinel `config.kdl`:
 
 ```kdl
 agents {
     agent "ratelimit" {
         type "custom"
         transport "unix_socket" {
-            path "/var/run/sentinel/ratelimit.sock"
+            path "/var/run/zentinel/ratelimit.sock"
         }
         events ["request_headers"]
         timeout-ms 50

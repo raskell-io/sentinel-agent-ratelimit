@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.4
 
-# Sentinel Rate Limit Agent Container Image
+# Zentinel Rate Limit Agent Container Image
 #
 # Targets:
 #   - prebuilt: For CI with pre-built binaries
@@ -10,16 +10,16 @@
 ################################################################################
 FROM gcr.io/distroless/cc-debian12:nonroot AS prebuilt
 
-COPY sentinel-ratelimit-agent /sentinel-ratelimit-agent
+COPY zentinel-ratelimit-agent /zentinel-ratelimit-agent
 
-LABEL org.opencontainers.image.title="Sentinel Rate Limit Agent" \
-      org.opencontainers.image.description="Sentinel Rate Limit Agent for Sentinel reverse proxy" \
+LABEL org.opencontainers.image.title="Zentinel Rate Limit Agent" \
+      org.opencontainers.image.description="Zentinel Rate Limit Agent for Zentinel reverse proxy" \
       org.opencontainers.image.vendor="Raskell" \
-      org.opencontainers.image.source="https://github.com/raskell-io/sentinel-agent-ratelimit"
+      org.opencontainers.image.source="https://github.com/zentinelproxy/zentinel-agent-ratelimit"
 
-ENV RUST_LOG=info,sentinel_ratelimit_agent=debug \
-    SOCKET_PATH=/var/run/sentinel/ratelimit.sock
+ENV RUST_LOG=info,zentinel_ratelimit_agent=debug \
+    SOCKET_PATH=/var/run/zentinel/ratelimit.sock
 
 USER nonroot:nonroot
 
-ENTRYPOINT ["/sentinel-ratelimit-agent"]
+ENTRYPOINT ["/zentinel-ratelimit-agent"]

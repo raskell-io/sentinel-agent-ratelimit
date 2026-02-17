@@ -1,4 +1,4 @@
-//! Rate Limit Agent - Token bucket rate limiting for Sentinel
+//! Rate Limit Agent - Token bucket rate limiting for Zentinel
 //!
 //! This agent provides distributed rate limiting using token bucket algorithm
 //! with support for multiple rate limit keys and configurable limits.
@@ -32,12 +32,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
-use sentinel_agent_protocol::v2::{
+use zentinel_agent_protocol::v2::{
     AgentCapabilities, AgentFeatures, AgentHandlerV2, AgentLimits, CounterMetric, DrainReason,
     GaugeMetric, GrpcAgentServerV2, HealthConfig, HealthStatus, LoadMetrics, MetricsReport,
     ShutdownReason,
 };
-use sentinel_agent_protocol::{
+use zentinel_agent_protocol::{
     AgentResponse, AgentServer, AuditMetadata, Decision, EventType, HeaderOp, RequestHeadersEvent,
 };
 
@@ -337,8 +337,8 @@ impl RateLimitAgentV1Wrapper {
 }
 
 #[async_trait]
-impl sentinel_agent_protocol::AgentHandler for RateLimitAgentV1Wrapper {
-    async fn on_configure(&self, event: sentinel_agent_protocol::ConfigureEvent) -> AgentResponse {
+impl zentinel_agent_protocol::AgentHandler for RateLimitAgentV1Wrapper {
+    async fn on_configure(&self, event: zentinel_agent_protocol::ConfigureEvent) -> AgentResponse {
         info!(
             agent_id = %event.agent_id,
             "Received configuration event (v1)"
@@ -391,7 +391,7 @@ impl AgentHandlerV2 for RateLimitAgent {
         AgentCapabilities {
             protocol_version: 2,
             agent_id: "ratelimit-agent".to_string(),
-            name: "Sentinel Rate Limit Agent".to_string(),
+            name: "Zentinel Rate Limit Agent".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             supported_events: vec![EventType::RequestHeaders, EventType::Configure],
             features: AgentFeatures {
@@ -477,7 +477,7 @@ impl AgentHandlerV2 for RateLimitAgent {
         if is_draining {
             HealthStatus {
                 agent_id: "ratelimit-agent".to_string(),
-                state: sentinel_agent_protocol::v2::HealthState::Draining { eta_ms: None },
+                state: zentinel_agent_protocol::v2::HealthState::Draining { eta_ms: None },
                 message: Some("Agent is draining".to_string()),
                 load: Some(self.get_load_metrics()),
                 resources: None,
@@ -658,7 +658,7 @@ async fn process_request_headers(
         headers.insert("Retry-After".to_string(), "1".to_string());
 
         AgentResponse {
-            version: sentinel_agent_protocol::PROTOCOL_VERSION,
+            version: zentinel_agent_protocol::PROTOCOL_VERSION,
             decision: Decision::Block {
                 status,
                 body: Some(message),
