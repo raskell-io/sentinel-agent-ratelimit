@@ -35,10 +35,10 @@ use tracing::{debug, info, warn};
 use zentinel_agent_protocol::v2::{
     AgentCapabilities, AgentFeatures, AgentHandlerV2, AgentLimits, CounterMetric, DrainReason,
     GaugeMetric, GrpcAgentServerV2, HealthConfig, HealthStatus, LoadMetrics, MetricsReport,
-    ShutdownReason,
+    ShutdownReason, UdsAgentServerV2,
 };
 use zentinel_agent_protocol::{
-    AgentResponse, AgentServer, AuditMetadata, Decision, EventType, HeaderOp, RequestHeadersEvent,
+    AgentResponse, AuditMetadata, Decision, EventType, HeaderOp, RequestHeadersEvent,
 };
 
 /// Rate limit agent command-line arguments
@@ -325,65 +325,6 @@ impl RateLimitAgent {
     }
 }
 
-/// Wrapper for v1 AgentHandler compatibility (UDS transport)
-struct RateLimitAgentV1Wrapper {
-    inner: RateLimitAgent,
-}
-
-impl RateLimitAgentV1Wrapper {
-    fn new(agent: RateLimitAgent) -> Self {
-        Self { inner: agent }
-    }
-}
-
-#[async_trait]
-impl zentinel_agent_protocol::AgentHandler for RateLimitAgentV1Wrapper {
-    async fn on_configure(&self, event: zentinel_agent_protocol::ConfigureEvent) -> AgentResponse {
-        info!(
-            agent_id = %event.agent_id,
-            "Received configuration event (v1)"
-        );
-
-        // Parse the configuration from JSON
-        match serde_json::from_value::<RateLimitConfig>(event.config) {
-            Ok(new_config) => {
-                info!(
-                    rules = new_config.rules.len(),
-                    default_rps = new_config.default.requests_per_second,
-                    dry_run = new_config.dry_run,
-                    "Applying new rate limit configuration"
-                );
-
-                // Update the configuration
-                let mut config = self.inner.config.write();
-                *config = new_config;
-
-                // Clear existing rate limiters to apply new rules
-                self.inner.limiters.clear();
-                self.inner
-                    .metrics
-                    .active_limiters
-                    .store(0, Ordering::Relaxed);
-
-                debug!("Configuration updated successfully");
-                AgentResponse::default_allow()
-            }
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    "Failed to parse configuration, keeping existing config"
-                );
-                // Return allow but log the error - don't block requests due to config error
-                AgentResponse::default_allow()
-            }
-        }
-    }
-
-    async fn on_request_headers(&self, event: RequestHeadersEvent) -> AgentResponse {
-        process_request_headers(&self.inner, event).await
-    }
-}
-
 #[async_trait]
 impl AgentHandlerV2 for RateLimitAgent {
     /// Return agent capabilities for v2 protocol handshake
@@ -420,11 +361,11 @@ impl AgentHandlerV2 for RateLimitAgent {
         }
     }
 
-    /// Handle configuration updates (v2 signature)
+    /// Handle configuration updates
     async fn on_configure(&self, config: serde_json::Value, version: Option<String>) -> bool {
         info!(
             version = ?version,
-            "Received configuration event (v2)"
+            "Received configuration event"
         );
 
         // Parse the configuration from JSON
@@ -574,7 +515,7 @@ impl HealthStatusExt for HealthStatus {
     }
 }
 
-/// Shared request processing logic for both v1 and v2
+/// Request processing logic
 async fn process_request_headers(
     agent: &RateLimitAgent,
     event: RequestHeadersEvent,
@@ -833,12 +774,10 @@ async fn main() -> Result<()> {
             .await
             .context("Failed to run rate limit agent gRPC server")?;
     } else {
-        // Use UDS transport (v1 compatible with v2 handler)
-        info!(socket = ?args.socket, "Starting UDS server");
+        // Use UDS transport (v2)
+        info!(socket = ?args.socket, "Starting UDS server (v2 protocol)");
 
-        // Wrap the v2 agent in a v1-compatible wrapper for UDS
-        let wrapper = RateLimitAgentV1Wrapper::new(agent);
-        let server = AgentServer::new("ratelimit-agent", args.socket, Box::new(wrapper));
+        let server = UdsAgentServerV2::new("ratelimit-agent", args.socket, Box::new(agent));
 
         info!("Rate limit agent ready and listening on UDS");
 
