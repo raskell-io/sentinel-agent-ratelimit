@@ -599,7 +599,7 @@ async fn process_request_headers(
         headers.insert("Retry-After".to_string(), "1".to_string());
 
         AgentResponse {
-            version: zentinel_agent_protocol::PROTOCOL_VERSION,
+            version: zentinel_agent_protocol::v2::PROTOCOL_VERSION_2,
             decision: Decision::Block {
                 status,
                 body: Some(message),
